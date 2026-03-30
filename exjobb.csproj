@@ -9,13 +9,22 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- EF Core + MySQL -->
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Pomelo.EntityFrameworkCore.MySql" Version="9.0.0" />
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.6" />
+
+    <!-- Azure AI Agents + Projects -->
+    <PackageReference Include="Azure.AI.Agents.Persistent" Version="1.1.0" />
+    <PackageReference Include="Azure.AI.Projects" Version="1.1.0" />
+    <PackageReference Include="Azure.Core" Version="1.51.1" />
+    <PackageReference Include="Azure.Identity" Version="1.19.0" />
+
+    <!-- Optional: keep Swashbuckle only if you still want Swagger UI -->
+    <!-- <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.6" /> -->
   </ItemGroup>
 
 </Project>

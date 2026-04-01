@@ -63,7 +63,7 @@ app.MapGet("/health", async (AppDbContext dbContext) =>
 .WithName("HealthCheck");
 
 // Chat endpoint
-app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsClient, IConfiguration config) =>
+app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsClient, IConfiguration config, ILogger<Program> logger) =>
 {
     var agentId = config["AGENT_ID"] ?? Environment.GetEnvironmentVariable("AGENT_ID");
     if (string.IsNullOrEmpty(agentId))
@@ -83,6 +83,17 @@ app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsCl
         run = agentsClient.Runs.GetRun(thread.Id, run.Id);
     }
     while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress);
+
+    if (run.Status != RunStatus.Completed)
+    {
+        logger.LogError("Agent run failed. Status={Status}, Code={Code}, Error={Message}",
+            run.Status,
+            run.LastError?.Code,
+            run.LastError?.Message);
+
+        return Results.Problem(
+            $"Agent run failed with status: {run.Status}. Error: {run.LastError?.Message}");
+    }
 
     if (run.Status != RunStatus.Completed)
         return Results.Problem($"Agent run failed with status: {run.Status}. Error: {run.LastError?.Message}");
@@ -117,8 +128,15 @@ app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql
     try
     {
         logger.LogInformation("Incoming /tools/execute-sql - Query: {SqlQuery}", request.Sql);
-        logger.LogInformation("Survey: {Survey}", request.Survey);
+        logger.LogInformation("Log payload: {@Log}", request.Log);
+
         var result = await sql.ExecuteSqlQueryAsync(request.Sql);
+
+        if (!result.StartsWith("DB ERROR:", StringComparison.OrdinalIgnoreCase))
+        {
+            await sql.InsertAgentActionLogAsync(request.Log);
+        }
+
         logger.LogInformation("Result: {SqlResult}", result);
         return Results.Ok(new SqlQueryResponse(result));
     }
@@ -129,7 +147,7 @@ app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql
     }
 });
 
-app.MapPost("/tools/get-table-ddl", async (TableDdlRequest request, SqlService sql, ILogger<Program> logger) =>
+/*app.MapPost("/tools/get-table-ddl", async (TableDdlRequest request, SqlService sql, ILogger<Program> logger) =>
 {
     try
     {
@@ -144,6 +162,32 @@ app.MapPost("/tools/get-table-ddl", async (TableDdlRequest request, SqlService s
         logger.LogError(ex, "Error in /tools/get-table-ddl");
         return Results.BadRequest(new TableDdlResponse($"Error: {ex.Message}"));
     }
+});*/
+
+app.MapPost("/tools/get-permissions-by-name",
+    async (GetPermissionsRequest request,
+           SqlService sql,
+           ILogger<Program> logger) =>
+{
+    try
+    {
+        logger.LogInformation("Log payload: {@Log}", request.Log);
+
+        var result = await sql.GetPermissionsByFullNameAsync(request.FullName, false); // ÄNDRA FRÅN BOOL TILL TEXT HÄR!!!
+
+        if (!result.StartsWith("DB ERROR:", StringComparison.OrdinalIgnoreCase))
+        {
+            await sql.InsertAgentActionLogAsync(request.Log);
+        }
+
+        logger.LogInformation("Permissions result: {Result}", result);
+        return Results.Ok(new GetPermissionsResponse(result));
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error in /tools/get-permissions-by-name");
+        return Results.BadRequest(new GetPermissionsResponse($"Error: {ex.Message}"));
+    }
 });
 
 // Serve chat UI (must be last — catch-all for root)
@@ -156,6 +200,16 @@ app.MapGet("/", async context =>
 app.Run();
 
 // DTOs
+public sealed record AgentActionLogDto(
+    long UserPromptId,
+    int ToolIndex,
+    string ToolName,
+    string Client,
+    bool IsNL,
+    string UserPrompt,
+    bool IsBad,
+    string ReasonLog
+);
 public sealed record ChatRequest(string Message, string? ThreadId = null);
 
 public sealed record ChatResponse
@@ -164,7 +218,17 @@ public sealed record ChatResponse
     public string ThreadId { get; init; } = string.Empty;
 }
 
-public sealed record SqlQueryRequest(string Sql, string Survey);
+public sealed record SqlQueryRequest(
+    string Sql,
+    AgentActionLogDto Log
+);
 public sealed record SqlQueryResponse(string Result);
 public sealed record TableDdlRequest(string TableName, string Survey);
 public sealed record TableDdlResponse(string Ddl);
+
+public sealed record GetPermissionsRequest(
+    string FullName,
+    AgentActionLogDto Log
+);
+
+public sealed record GetPermissionsResponse(string Result);

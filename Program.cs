@@ -1,3 +1,4 @@
+using System.Text.Json;
 using App.Data;
 using Azure;
 using Azure.AI.Agents.Persistent;
@@ -8,7 +9,6 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// EF Core DbContext with MySQL (Pomelo)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseMySql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
@@ -16,10 +16,9 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     )
 );
 
-// Raw SQL service (MySqlConnector, used directly for agent tool endpoints)
 builder.Services.AddSingleton<SqlService>();
+builder.Services.AddTransient<Generator>();
 
-// Azure AI Persistent Agents client
 builder.Services.AddSingleton(sp =>
 {
     var config = sp.GetRequiredService<IConfiguration>();
@@ -47,7 +46,6 @@ app.UseStaticFiles();
 app.UseAuthorization();
 app.MapControllers();
 
-// Health check (moved off "/" so the chat UI can live there)
 app.MapGet("/health", async (AppDbContext dbContext) =>
 {
     try
@@ -62,27 +60,46 @@ app.MapGet("/health", async (AppDbContext dbContext) =>
 })
 .WithName("HealthCheck");
 
-// Chat endpoint
-app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsClient, IConfiguration config, ILogger<Program> logger) =>
+app.MapPost("/chat", async (
+    ChatRequest request,
+    PersistentAgentsClient agentsClient,
+    IConfiguration config,
+    ILogger<Program> logger) =>
 {
+    logger.LogInformation("POST /chat: incoming message: {Message}, threadId={ThreadId}",
+        request.Message, request.ThreadId);
+
     var agentId = config["AGENT_ID"] ?? Environment.GetEnvironmentVariable("AGENT_ID");
     if (string.IsNullOrEmpty(agentId))
+    {
+        logger.LogError("AGENT_ID not configured.");
         return Results.BadRequest("AGENT_ID not configured.");
+    }
 
     PersistentAgentThread thread = !string.IsNullOrWhiteSpace(request.ThreadId)
         ? agentsClient.Threads.GetThread(request.ThreadId)
         : agentsClient.Threads.CreateThread();
 
+    logger.LogInformation("Using thread {ThreadId}", thread.Id);
+
     agentsClient.Messages.CreateMessage(thread.Id, MessageRole.User, request.Message);
+    logger.LogInformation("Created user message in thread {ThreadId}", thread.Id);
 
     ThreadRun run = agentsClient.Runs.CreateRun(thread.Id, agentId);
+    logger.LogInformation("Created run {RunId} with initial status {Status}", run.Id, run.Status);
 
-    do
+    while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
     {
         await Task.Delay(500);
         run = agentsClient.Runs.GetRun(thread.Id, run.Id);
+
+        logger.LogInformation(
+            "Polled run {RunId}: status={Status}, lastErrorCode={Code}, lastErrorMessage={Message}",
+            run.Id,
+            run.Status,
+            run.LastError?.Code,
+            run.LastError?.Message);
     }
-    while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress);
 
     if (run.Status != RunStatus.Completed)
     {
@@ -91,12 +108,11 @@ app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsCl
             run.LastError?.Code,
             run.LastError?.Message);
 
+        logger.LogError("Run debug dump: {@Run}", run);
+
         return Results.Problem(
             $"Agent run failed with status: {run.Status}. Error: {run.LastError?.Message}");
     }
-
-    if (run.Status != RunStatus.Completed)
-        return Results.Problem($"Agent run failed with status: {run.Status}. Error: {run.LastError?.Message}");
 
     Pageable<PersistentThreadMessage> messages = agentsClient.Messages.GetMessages(
         threadId: thread.Id,
@@ -115,14 +131,16 @@ app.MapPost("/chat", async (ChatRequest request, PersistentAgentsClient agentsCl
         foreach (MessageContent contentItem in lastAgentMessage.ContentItems)
         {
             if (contentItem is MessageTextContent textItem)
-                responseText += textItem.Text;
+                responseText += textItem.Text ?? string.Empty;
         }
     }
+
+    logger.LogInformation("POST /chat completed for thread {ThreadId}. Response length={Length}",
+    thread.Id, responseText.Length);
 
     return Results.Ok(new ChatResponse { Response = responseText, ThreadId = thread.Id });
 });
 
-// Tool endpoints
 app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql, ILogger<Program> logger) =>
 {
     try
@@ -131,11 +149,6 @@ app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql
         logger.LogInformation("Log payload: {@Log}", request.Log);
 
         var result = await sql.ExecuteSqlQueryAsync(request.Sql);
-
-        if (!result.StartsWith("DB ERROR:", StringComparison.OrdinalIgnoreCase))
-        {
-            await sql.InsertAgentActionLogAsync(request.Log);
-        }
 
         logger.LogInformation("Result: {SqlResult}", result);
         return Results.Ok(new SqlQueryResponse(result));
@@ -147,23 +160,6 @@ app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql
     }
 });
 
-/*app.MapPost("/tools/get-table-ddl", async (TableDdlRequest request, SqlService sql, ILogger<Program> logger) =>
-{
-    try
-    {
-        logger.LogInformation("Incoming /tools/get-table-ddl - Table: {TableName}", request.TableName);
-        logger.LogInformation("Survey: {Survey}", request.Survey);
-        var ddl = await sql.GetTableDdlAsync(request.TableName);
-        logger.LogInformation("DDL: {TableDdl}", ddl);
-        return Results.Ok(new TableDdlResponse(ddl));
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Error in /tools/get-table-ddl");
-        return Results.BadRequest(new TableDdlResponse($"Error: {ex.Message}"));
-    }
-});*/
-
 app.MapPost("/tools/get-permissions-by-name",
     async (GetPermissionsRequest request,
            SqlService sql,
@@ -173,12 +169,7 @@ app.MapPost("/tools/get-permissions-by-name",
     {
         logger.LogInformation("Log payload: {@Log}", request.Log);
 
-        var result = await sql.GetPermissionsByFullNameAsync(request.FullName, false); // ÄNDRA FRÅN BOOL TILL TEXT HÄR!!!
-
-        if (!result.StartsWith("DB ERROR:", StringComparison.OrdinalIgnoreCase))
-        {
-            await sql.InsertAgentActionLogAsync(request.Log);
-        }
+        var result = await sql.GetPermissionsByFullNameAsync(request.FullName);
 
         logger.LogInformation("Permissions result: {Result}", result);
         return Results.Ok(new GetPermissionsResponse(result));
@@ -190,7 +181,40 @@ app.MapPost("/tools/get-permissions-by-name",
     }
 });
 
-// Serve chat UI (must be last — catch-all for root)
+app.MapPost("/tools/generate-scenarios", (
+    IServiceProvider serviceProvider,
+    IConfiguration config,
+    ILogger<Program> logger) =>
+{
+    var agentId = config["AGENT_ID"] ?? Environment.GetEnvironmentVariable("AGENT_ID");
+    if (string.IsNullOrEmpty(agentId))
+    {
+        logger.LogError("AGENT_ID is missing in the config.");
+        return Results.BadRequest("AGENT_ID is missing in the config.");
+    }
+
+    logger.LogInformation("Received POST /tools/generate-scenarios. Starting Task.Run...");
+
+    _ = Task.Run(async () => 
+    {
+        try
+        {
+            using var scope = serviceProvider.CreateScope();
+            var generator = scope.ServiceProvider.GetRequiredService<Generator>();
+            await generator.RunGenerationLoop(agentId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "A critical error occurred within the background thread.");
+        }
+    });
+
+    return Results.Accepted(value: new { 
+        Message = "Generation of scenarios has started in the background, follow the process in the server's console." 
+    });
+});
+
+// webpage
 app.MapGet("/", async context =>
 {
     context.Response.ContentType = "text/html";
@@ -232,3 +256,13 @@ public sealed record GetPermissionsRequest(
 );
 
 public sealed record GetPermissionsResponse(string Result);
+
+public record SaveScenarioRequest(
+    string UserId,
+    string PromptText,
+    string Category,
+    bool ExpectedIsAllowed,
+    List<string> ExpectedTools,
+    List<string> RequiredPermissions,
+    string Rationale
+);

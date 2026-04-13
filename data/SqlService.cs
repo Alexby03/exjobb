@@ -74,7 +74,10 @@ public class SqlService
             (@UserId, @PromptText, @Category, @ExpectedIsAllowed, @Counterparty, @ExpectedTools, @RequiredPermissions, @Rationale, @SetupData)";
 
         await using var conn = await ConnectAsync();
-        await using var command = new MySqlCommand(sql, conn);
+        
+        await using var transaction = await conn.BeginTransactionAsync();
+        
+        await using var command = new MySqlCommand(sql, conn, transaction);
 
         string expectedToolsJson = JsonSerializer.Serialize(data.ExpectedTools);
         string requiredPermissionsJson = JsonSerializer.Serialize(data.RequiredPermissions);
@@ -96,16 +99,41 @@ public class SqlService
             
             if (affected > 0)
             {
+                await transaction.CommitAsync();
                 return $"Success: Affected {affected} rows. Scenario saved.";
             }
             else
             {
+                await transaction.RollbackAsync();
                 return "Warning: No rows were inserted.";
+            }
+        }
+        catch (MySqlException sqlEx)
+        {
+            try { await transaction.RollbackAsync(); } catch { }
+
+            if (sqlEx.Number == 1062) // 1062 = Duplicate entry for key
+            {
+                _logger.LogWarning("     [DB WARNING] Duplicate entry discovered for UserId: {UserId}, Category: {Category}. Row skipped.", userId, category);
+                return $"DB WARNING: Duplicate entry. {sqlEx.Message}";
+            }
+            else if (sqlEx.Number == 1213) // 1213 = Deadlock found when trying to get lock
+            {
+                _logger.LogError("     [DB ERROR] Deadlock in database for UserId: {UserId}. Another query is blocking.", userId);
+                return $"DB ERROR: Deadlock. {sqlEx.Message}";
+            }
+            else
+            {
+                _logger.LogError(sqlEx, "     [DB ERROR] MySQL error {ErrorNumber} during insertion. UserId: {UserId}. Data: {@Data}", sqlEx.Number, userId, data);
+                return $"DB ERROR: {sqlEx.Message}";
             }
         }
         catch (Exception ex)
         {
-            return $"DB ERROR: {ex.Message}";
+            try { await transaction.RollbackAsync(); } catch { }
+            
+            _logger.LogError(ex, "     [CRITICAL] Unexpected error in database method for UserId: {UserId}, Category: {Category}", userId, category);
+            return $"DB FATAL: {ex.Message}";
         }
     }
 
@@ -186,7 +214,7 @@ public class SqlService
 
             if (permissions.Count == 0)
             {
-                _logger.LogWarning("Inga behörigheter hittades för UserId: {UserId}", userId);
+                _logger.LogWarning("No permissions found for UserId: {UserId}", userId);
                 return string.Empty;
             }
 
@@ -194,7 +222,7 @@ public class SqlService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "DB ERROR i GetPermissionsByUserIdAsync för UserId: {UserId}", userId);
+            _logger.LogError(ex, "DB ERROR in GetPermissionsByUserIdAsync for UserId: {UserId}", userId);
             return string.Empty;
         }
     }

@@ -23,7 +23,7 @@ public class MissionFactory
             _ => false
         };
 
-        // 1. Rulla för Counterparty (0-1 = Solo, 2 = Boss, 3 = Colleague)
+        // 1. 0-1 = Solo, 2 = Boss, 3 = Colleague
         int roll = _rng.Next(4);
         string counterpartyType = "solo";
         string? activeCounterpartyId = null;
@@ -43,19 +43,17 @@ public class MissionFactory
         {
             Category = category,
             ExpectedOutcome = expectedOutcome,
-            Counterparty = counterpartyType // Spara resultatet direkt i modellen!
+            Counterparty = counterpartyType
         };
 
-        // 2. Skapa resurser
         int resourceCount = _rng.Next(1, 4);
         var domains = Enum.GetValues<ResourceDomain>();
 
         for (int i = 0; i < resourceCount; i++)
         {
             var domain = domains[_rng.Next(domains.Length)];
-            string ownerId = currentUserId; // Default till användaren själv
+            string ownerId = currentUserId;
 
-            // Om vi har en motpart: tvinga första resursen att vara deras, annars 50/50
             if (activeCounterpartyId != null)
             {
                 if (i == 0 || _rng.Next(2) == 0)

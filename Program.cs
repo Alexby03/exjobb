@@ -1,9 +1,7 @@
-using System.Text.Json;
+using System.Collections.Concurrent;
+using OpenAI;
 using App.Data;
-using Azure;
-using Azure.AI.Agents.Persistent;
-using Azure.AI.Projects;
-using Azure.Identity;
+using OpenAI.Chat;
 using localdotnet.Services;
 using Microsoft.EntityFrameworkCore;
 
@@ -16,19 +14,30 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     )
 );
 
-builder.Services.AddSingleton<SqlService>();
+builder.Services.AddScoped<SqlService>();
 builder.Services.AddTransient<Generator>();
 
-builder.Services.AddSingleton(sp =>
+builder.Services.AddSingleton<ChatClient>(sp =>
 {
     var config = sp.GetRequiredService<IConfiguration>();
-    var endpoint = config["PROJECT_ENDPOINT"] ?? Environment.GetEnvironmentVariable("PROJECT_ENDPOINT");
+    var endpoint = config["AZURE_OPENAI_ENDPOINT"] ?? Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
+    var deploymentName = config["DEPLOYMENT_NAME"] ?? Environment.GetEnvironmentVariable("DEPLOYMENT_NAME");
+    var apiKey = config["AZURE_OPENAI_KEY"] ?? Environment.GetEnvironmentVariable("AZURE_OPENAI_KEY");
 
-    if (string.IsNullOrWhiteSpace(endpoint))
-        throw new InvalidOperationException("Set PROJECT_ENDPOINT in config or environment variables.");
+    if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(deploymentName))
+        throw new InvalidOperationException("Set AZURE_OPENAI_ENDPOINT and DEPLOYMENT_NAME in config or environment variables.");
 
-    var projectClient = new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential());
-    return projectClient.GetPersistentAgentsClient();
+    if (string.IsNullOrWhiteSpace(apiKey))
+        throw new InvalidOperationException("Mistral serverless endpoint requires an API Key.");
+
+    var clientOptions = new OpenAIClientOptions 
+    { 
+        Endpoint = new Uri(endpoint) 
+    };
+    
+    var openAIClient = new OpenAIClient(new System.ClientModel.ApiKeyCredential(apiKey), clientOptions);
+
+    return openAIClient.GetChatClient(deploymentName);
 });
 
 builder.Services.AddControllers();
@@ -46,6 +55,8 @@ app.UseStaticFiles();
 app.UseAuthorization();
 app.MapControllers();
 
+var threadMemory = new ConcurrentDictionary<string, List<ChatMessage>>();
+
 app.MapGet("/health", async (AppDbContext dbContext) =>
 {
     try
@@ -57,127 +68,41 @@ app.MapGet("/health", async (AppDbContext dbContext) =>
     {
         return Results.StatusCode(503);
     }
-})
-.WithName("HealthCheck");
+}).WithName("HealthCheck");
 
 app.MapPost("/chat", async (
     ChatRequest request,
-    PersistentAgentsClient agentsClient,
+    ChatClient chatClient, 
     IConfiguration config,
     ILogger<Program> logger) =>
 {
-    logger.LogInformation("POST /chat: incoming message: {Message}, threadId={ThreadId}",
-        request.Message, request.ThreadId);
+    logger.LogInformation("POST /chat: incoming message: {Message}, threadId={ThreadId}", request.Message, request.ThreadId);
 
-    var agentId = config["AGENT_ID"] ?? Environment.GetEnvironmentVariable("AGENT_ID");
-    if (string.IsNullOrEmpty(agentId))
+    string currentThreadId = string.IsNullOrWhiteSpace(request.ThreadId) ? Guid.NewGuid().ToString() : request.ThreadId;
+    
+    var history = threadMemory.GetOrAdd(currentThreadId, _ => new List<ChatMessage> 
     {
-        logger.LogError("AGENT_ID not configured.");
-        return Results.BadRequest("AGENT_ID not configured.");
-    }
+        new SystemChatMessage("You are a helpful AI assistant.") // filler completion
+    });
+    history.Add(new UserChatMessage(request.Message));
 
-    PersistentAgentThread thread = !string.IsNullOrWhiteSpace(request.ThreadId)
-        ? agentsClient.Threads.GetThread(request.ThreadId)
-        : agentsClient.Threads.CreateThread();
-
-    logger.LogInformation("Using thread {ThreadId}", thread.Id);
-
-    agentsClient.Messages.CreateMessage(thread.Id, MessageRole.User, request.Message);
-    logger.LogInformation("Created user message in thread {ThreadId}", thread.Id);
-
-    ThreadRun run = agentsClient.Runs.CreateRun(thread.Id, agentId);
-    logger.LogInformation("Created run {RunId} with initial status {Status}", run.Id, run.Status);
-
-    while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
-    {
-        await Task.Delay(500);
-        run = agentsClient.Runs.GetRun(thread.Id, run.Id);
-
-        logger.LogInformation(
-            "Polled run {RunId}: status={Status}, lastErrorCode={Code}, lastErrorMessage={Message}",
-            run.Id,
-            run.Status,
-            run.LastError?.Code,
-            run.LastError?.Message);
-    }
-
-    if (run.Status != RunStatus.Completed)
-    {
-        logger.LogError("Agent run failed. Status={Status}, Code={Code}, Error={Message}",
-            run.Status,
-            run.LastError?.Code,
-            run.LastError?.Message);
-
-        logger.LogError("Run debug dump: {@Run}", run);
-
-        return Results.Problem(
-            $"Agent run failed with status: {run.Status}. Error: {run.LastError?.Message}");
-    }
-
-    Pageable<PersistentThreadMessage> messages = agentsClient.Messages.GetMessages(
-        threadId: thread.Id,
-        order: ListSortOrder.Ascending);
-
-    PersistentThreadMessage? lastAgentMessage = null;
-    foreach (var msg in messages)
-    {
-        if (msg.Role == MessageRole.Agent)
-            lastAgentMessage = msg;
-    }
-
-    string responseText = string.Empty;
-    if (lastAgentMessage != null)
-    {
-        foreach (MessageContent contentItem in lastAgentMessage.ContentItems)
-        {
-            if (contentItem is MessageTextContent textItem)
-                responseText += textItem.Text ?? string.Empty;
-        }
-    }
-
-    logger.LogInformation("POST /chat completed for thread {ThreadId}. Response length={Length}",
-    thread.Id, responseText.Length);
-
-    return Results.Ok(new ChatResponse { Response = responseText, ThreadId = thread.Id });
-});
-
-app.MapPost("/tools/execute-sql", async (SqlQueryRequest request, SqlService sql, ILogger<Program> logger) =>
-{
     try
     {
-        logger.LogInformation("Incoming /tools/execute-sql - Query: {SqlQuery}", request.Sql);
-        logger.LogInformation("Log payload: {@Log}", request.Log);
+        logger.LogInformation("Sending request directly to LLM for thread {ThreadId}...", currentThreadId);
+        
+        ChatCompletion completion = await chatClient.CompleteChatAsync(history);
+        
+        string responseText = completion.Content[0].Text;
 
-        var result = await sql.ExecuteSqlQueryAsync(request.Sql);
+        history.Add(new AssistantChatMessage(responseText));
 
-        logger.LogInformation("Result: {SqlResult}", result);
-        return Results.Ok(new SqlQueryResponse(result));
+        logger.LogInformation("POST /chat completed for thread {ThreadId}. Response length={Length}", currentThreadId, responseText.Length);
+        return Results.Ok(new ChatResponse { Response = responseText, ThreadId = currentThreadId });
     }
     catch (Exception ex)
     {
-        logger.LogError(ex, "Error in /tools/execute-sql");
-        return Results.BadRequest(new SqlQueryResponse($"Error: {ex.Message}"));
-    }
-});
-
-app.MapPost("/tools/get-permissions-by-name",
-    async (GetPermissionsRequest request,
-           SqlService sql,
-           ILogger<Program> logger) =>
-{
-    try
-    {
-        logger.LogInformation("Log payload: {@Log}", request.Log);
-
-        var result = await sql.GetPermissionsByFullNameAsync(request.FullName);
-
-        logger.LogInformation("Permissions result: {Result}", result);
-        return Results.Ok(new GetPermissionsResponse(result));
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Error in /tools/get-permissions-by-name");
-        return Results.BadRequest(new GetPermissionsResponse($"Error: {ex.Message}"));
+        logger.LogError(ex, "Chat completion failed.");
+        return Results.Problem($"LLM Error: {ex.Message}");
     }
 });
 
@@ -186,13 +111,6 @@ app.MapPost("/tools/generate-scenarios", (
     IConfiguration config,
     ILogger<Program> logger) =>
 {
-    var agentId = config["AGENT_ID"] ?? Environment.GetEnvironmentVariable("AGENT_ID");
-    if (string.IsNullOrEmpty(agentId))
-    {
-        logger.LogError("AGENT_ID is missing in the config.");
-        return Results.BadRequest("AGENT_ID is missing in the config.");
-    }
-
     logger.LogInformation("Received POST /tools/generate-scenarios. Starting Task.Run...");
 
     _ = Task.Run(async () => 
@@ -201,7 +119,7 @@ app.MapPost("/tools/generate-scenarios", (
         {
             using var scope = serviceProvider.CreateScope();
             var generator = scope.ServiceProvider.GetRequiredService<Generator>();
-            await generator.RunGenerationLoop(agentId);
+            await generator.RunGenerationLoop(); // generator
         }
         catch (Exception ex)
         {
@@ -214,7 +132,6 @@ app.MapPost("/tools/generate-scenarios", (
     });
 });
 
-// webpage
 app.MapGet("/", async context =>
 {
     context.Response.ContentType = "text/html";

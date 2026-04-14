@@ -1,5 +1,3 @@
-using App.Data.Configurations;
-using App.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace App.Data;
@@ -7,15 +5,6 @@ namespace App.Data;
 public class AppDbContext : DbContext
 {
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
-
-    // DbSets
-    public DbSet<User> Users => Set<User>();
-    public DbSet<Document> Documents => Set<Document>();
-    public DbSet<Email> Emails => Set<Email>();
-    public DbSet<Customer> Customers => Set<Customer>();
-    public DbSet<CalendarEvent> CalendarEvents => Set<CalendarEvent>();
-    public DbSet<CalendarEventParticipant> CalendarEventParticipants => Set<CalendarEventParticipant>();
-    public DbSet<AgentActionLog> AgentActionLogs => Set<AgentActionLog>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

@@ -227,6 +227,26 @@ public class SqlService
         }
     }
 
+    public async Task<Dictionary<string, string>> GetAllSystemPermissionsAsync()
+    {
+        var permissions = new Dictionary<string, string>();
+        
+        string sql = "SELECT PermissionName, PermissionText FROM Permissions"; 
+
+        await using var conn = await ConnectAsync();
+        await using var command = new MySqlCommand(sql, conn);
+        await using var reader = await command.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            string name = reader.GetString(0);
+            string description = reader.GetString(1);
+            permissions[name] = description;
+        }
+
+        return permissions;
+    }
+
     public async Task<List<User>> GetAllUsersAsync()
     {
         var users = new List<User>();

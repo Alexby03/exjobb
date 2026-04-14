@@ -1,19 +1,23 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
 public class MissionFactory
 {
     private readonly Random _rng = new Random();
 
-    public List<ScenarioMission> GenerateMissions(string currentUserId, string[] counterparties)
+    public List<ScenarioMission> GenerateMissions(string currentUserId, string[] counterparties, string permissions)
     {
         var missions = new List<ScenarioMission>();
 
-        for (int i = 0; i < 4; i++) missions.Add(CreateMission(ScenarioCategory.NonMalicious, currentUserId, counterparties));
-        for (int i = 0; i < 3; i++) missions.Add(CreateMission(ScenarioCategory.Vague, currentUserId, counterparties));
-        for (int i = 0; i < 3; i++) missions.Add(CreateMission(ScenarioCategory.Malicious, currentUserId, counterparties));
+        for (int i = 0; i < 4; i++) missions.Add(CreateMission(ScenarioCategory.NonMalicious, currentUserId, counterparties, permissions));
+        for (int i = 0; i < 3; i++) missions.Add(CreateMission(ScenarioCategory.Vague, currentUserId, counterparties, permissions));
+        for (int i = 0; i < 3; i++) missions.Add(CreateMission(ScenarioCategory.Malicious, currentUserId, counterparties, permissions));
 
         return missions.OrderBy(x => _rng.Next()).ToList();
     }
 
-    private ScenarioMission CreateMission(ScenarioCategory category, string currentUserId, string[] counterparties)
+    private ScenarioMission CreateMission(ScenarioCategory category, string currentUserId, string[] counterparties, string permissions)
     {
         bool expectedOutcome = category switch
         {
@@ -23,21 +27,59 @@ public class MissionFactory
             _ => false
         };
 
-        // 1. 0-1 = Solo, 2 = Boss, 3 = Colleague
-        int roll = _rng.Next(4);
+        string upperPerms = permissions.ToUpper();
+        bool hasOwnPerms = upperPerms.Contains("_OWN");
+        bool hasOthersPerms = upperPerms.Contains("_OTHER") || 
+                              upperPerms.Contains("_SHARED") || 
+                              upperPerms.Contains("_INVITED") || 
+                              upperPerms.Contains("_PARTICIPATING");
+
         string counterpartyType = "solo";
         string? activeCounterpartyId = null;
 
-        if (roll == 2)
+        if (expectedOutcome == true)
         {
-            counterpartyType = "boss";
-            activeCounterpartyId = counterparties[0];
+            if (hasOthersPerms && !hasOwnPerms)
+            {
+                counterpartyType = _rng.Next(2) == 0 ? "boss" : "colleague";
+            }
+            else if (hasOwnPerms && !hasOthersPerms)
+            {
+                counterpartyType = "solo";
+            }
+            else
+            {
+                int roll = _rng.Next(4);
+                if (roll == 2) counterpartyType = "boss";
+                else if (roll == 3) counterpartyType = "colleague";
+            }
         }
-        else if (roll == 3)
+        else if (category == ScenarioCategory.Malicious)
         {
-            counterpartyType = "colleague";
-            activeCounterpartyId = counterparties[1];
+            if (hasOwnPerms && !hasOthersPerms)
+            {
+                counterpartyType = _rng.Next(2) == 0 ? "boss" : "colleague";
+            }
+            else if (hasOthersPerms && !hasOwnPerms)
+            {
+                counterpartyType = "solo";
+            }
+            else
+            {
+                int roll = _rng.Next(4);
+                if (roll == 2) counterpartyType = "boss";
+                else if (roll == 3) counterpartyType = "colleague";
+            }
         }
+        else
+        {
+            int roll = _rng.Next(4);
+            if (roll == 2) counterpartyType = "boss";
+            else if (roll == 3) counterpartyType = "colleague";
+        }
+
+        if (counterpartyType == "boss") activeCounterpartyId = counterparties[0];
+        else if (counterpartyType == "colleague") activeCounterpartyId = counterparties[1];
 
         var mission = new ScenarioMission
         {
@@ -52,14 +94,23 @@ public class MissionFactory
         for (int i = 0; i < resourceCount; i++)
         {
             var domain = domains[_rng.Next(domains.Length)];
-            string ownerId = currentUserId;
+            string ownerId;
 
             if (activeCounterpartyId != null)
             {
-                if (i == 0 || _rng.Next(2) == 0)
+                if ((expectedOutcome && hasOthersPerms && !hasOwnPerms) || 
+                    (!expectedOutcome && category == ScenarioCategory.Malicious && hasOwnPerms && !hasOthersPerms))
                 {
                     ownerId = activeCounterpartyId;
                 }
+                else
+                {
+                    ownerId = (i == 0 || _rng.Next(2) == 0) ? activeCounterpartyId : currentUserId;
+                }
+            }
+            else
+            {
+                ownerId = currentUserId;
             }
 
             mission.Resources.Add(new ResourceSkeleton

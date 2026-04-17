@@ -16,6 +16,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 builder.Services.AddScoped<SqlService>();
 builder.Services.AddTransient<Generator>();
+builder.Services.AddTransient<Tester>();
 
 builder.Services.AddSingleton<ChatClient>(sp =>
 {
@@ -69,6 +70,34 @@ app.MapGet("/health", async (AppDbContext dbContext) =>
         return Results.StatusCode(503);
     }
 }).WithName("HealthCheck");
+
+app.MapPost("/tools/test-scenarios", (
+    IServiceProvider serviceProvider,
+    IConfiguration config,
+    ILogger<Program> logger) =>
+{
+    logger.LogInformation("Received POST /tools/test-scenarios. Starting Task.Run...");
+
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            using var scope = serviceProvider.CreateScope();
+            var tester = scope.ServiceProvider.GetRequiredService<Tester>();
+            await tester.RunTestingLoop();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "A critical error occurred within the testing background thread.");
+        }
+    });
+
+    return Results.Accepted(value: new
+    {
+        Message = "Testing of scenarios has started in the background, follow the progress in the server's console."
+    });
+});
+
 
 app.MapPost("/chat", async (
     ChatRequest request,

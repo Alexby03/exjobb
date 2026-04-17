@@ -211,11 +211,14 @@ public class SqlService
                     permissions.Add(reader.GetString(0));
                 }
             }
-
             if (permissions.Count == 0)
             {
                 _logger.LogWarning("No permissions found for UserId: {UserId}", userId);
                 return string.Empty;
+            }
+            if (!isBool && permissions.Count > 1)
+            {
+                return string.Join(", ", permissions.Take(permissions.Count - 1)) + ", and " + permissions.Last();
             }
 
             return string.Join(", ", permissions);
@@ -285,6 +288,113 @@ public class SqlService
         }
 
         return users;
+    }
+
+    public async Task<List<ScenarioForTesting>> GetScenariosInRangeAsync(int floor, int ceiling)
+    {
+        var scenarios = new List<ScenarioForTesting>();
+
+        string sql = @"
+            SELECT ScenarioId, UserId, PromptText, SetupData
+            FROM generatedscenarios
+            WHERE ScenarioId BETWEEN @Floor AND @Ceiling
+            ORDER BY ScenarioId";
+
+        await using var conn = await ConnectAsync();
+        await using var command = new MySqlCommand(sql, conn);
+        command.Parameters.AddWithValue("@Floor", floor);
+        command.Parameters.AddWithValue("@Ceiling", ceiling);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            scenarios.Add(new ScenarioForTesting
+            {
+                ScenarioId = reader.GetInt32(0),
+                UserId     = reader.GetString(1),
+                PromptText = reader.GetString(2),
+                SetupDataJson = reader.IsDBNull(3) ? null : reader.GetString(3)
+            });
+        }
+
+        return scenarios;
+    }
+
+    public async Task<string> InsertTestResultAsync(int sessionId, TesterLogResponse data, string agentType)
+    {
+        string sql = @"
+            INSERT INTO testresults
+            (SessionId, IsUserAuth, IsUserAuthReasonLog,
+            IsMalicious, IsMaliciousReasonLog,
+            DidAssignment, DidAssignmentReasonLog,
+            ToolNames, ToolReason, AgentType)
+            VALUES
+            (@SessionId, @IsUserAuth, @IsUserAuthReasonLog,
+            @IsMalicious, @IsMaliciousReasonLog,
+            @DidAssignment, @DidAssignmentReasonLog,
+            @ToolNames, @ToolReason, @AgentType)
+            ON DUPLICATE KEY UPDATE
+            IsUserAuth = VALUES(IsUserAuth),
+            IsUserAuthReasonLog = VALUES(IsUserAuthReasonLog),
+            IsMalicious = VALUES(IsMalicious),
+            IsMaliciousReasonLog = VALUES(IsMaliciousReasonLog),
+            DidAssignment = VALUES(DidAssignment),
+            DidAssignmentReasonLog = VALUES(DidAssignmentReasonLog),
+            ToolNames = VALUES(ToolNames),
+            ToolReason = VALUES(ToolReason),
+            CreatedAt = CURRENT_TIMESTAMP";
+
+        await using var conn = await ConnectAsync();
+        await using var transaction = await conn.BeginTransactionAsync();
+        await using var command = new MySqlCommand(sql, conn, transaction);
+
+        string toolNamesJson = JsonSerializer.Serialize(data.ToolNames ?? new List<string>());
+
+        command.Parameters.AddWithValue("@SessionId", sessionId);
+        command.Parameters.AddWithValue("@IsUserAuth", data.IsUserAuth);
+        command.Parameters.AddWithValue("@IsUserAuthReasonLog", data.IsUserAuthReasonLog ?? string.Empty);
+        command.Parameters.AddWithValue("@IsMalicious", data.IsMalicious);
+        command.Parameters.AddWithValue("@IsMaliciousReasonLog", data.IsMaliciousReasonLog ?? string.Empty);
+        command.Parameters.AddWithValue("@DidAssignment", data.DidAssignment);
+        command.Parameters.AddWithValue("@DidAssignmentReasonLog", data.DidAssignmentReasonLog ?? string.Empty);
+        command.Parameters.AddWithValue("@ToolNames", toolNamesJson);
+        command.Parameters.AddWithValue("@ToolReason", data.ToolReason ?? string.Empty);
+        command.Parameters.AddWithValue("@AgentType", agentType);
+
+        try
+        {
+            int affected = await command.ExecuteNonQueryAsync();
+            if (affected > 0)
+            {
+                await transaction.CommitAsync();
+                return $"Success: {affected} row(s) inserted into testresults (SessionId={sessionId}).";
+            }
+            else
+            {
+                await transaction.RollbackAsync();
+                return "Warning: No rows inserted into testresults.";
+            }
+        }
+        catch (MySqlException sqlEx)
+        {
+            try { await transaction.RollbackAsync(); } catch { }
+
+            if (sqlEx.Number == 1213)
+            {
+                _logger.LogError("     [DB ERROR] Deadlock in testresults insert for SessionId={SessionId}.", sessionId);
+                return $"DB ERROR: Deadlock. {sqlEx.Message}";
+            }
+
+            _logger.LogError(sqlEx, "     [DB ERROR] MySQL error {ErrorNumber} inserting testresults. SessionId={SessionId}.",
+                sqlEx.Number, sessionId);
+            return $"DB ERROR: {sqlEx.Message}";
+        }
+        catch (Exception ex)
+        {
+            try { await transaction.RollbackAsync(); } catch { }
+            _logger.LogError(ex, "     [CRITICAL] Unexpected error inserting testresults. SessionId={SessionId}.", sessionId);
+            return $"DB FATAL: {ex.Message}";
+        }
     }
 }
 

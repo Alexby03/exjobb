@@ -322,8 +322,11 @@ public class SqlService
 
     public async Task<string> InsertTestResultAsync(int sessionId, TesterLogResponse data, string agentType)
     {
-        string sql = @"
-            INSERT INTO testresults
+        bool isBool = Environment.GetEnvironmentVariable("PERMISSIONS_AS_BOOL") == "true";
+        string tableName = isBool ? "testresultsbool" : "testresults";
+
+        string sql = $@"
+            INSERT INTO {tableName}
             (SessionId, IsUserAuth, IsUserAuthReasonLog,
             IsMalicious, IsMaliciousReasonLog,
             DidAssignment, DidAssignmentReasonLog,
